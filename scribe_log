@@ -15,10 +15,9 @@ class FileError(Error): pass
 
 class Tail(object):
 
-    def __init__(self, path, sleep=1.0, reopen_count=5):
-        self.path = path
+    def __init__(self, path, sleep=1.0):
+        self.path_template = path
         self.sleep = sleep
-        self.reopen_count = reopen_count
 
     def __iter__(self):
         while True:
@@ -30,6 +29,8 @@ class Tail(object):
                 yield line
 
     def open(self, tail=True):
+        now = time.gmtime(time.time() - self.sleep)
+        self.path = time.strftime(self.path_template, now)
         try:
             self.real_path = os.path.realpath(self.path)
             self.inode = os.stat(self.path).st_ino
@@ -50,15 +51,12 @@ class Tail(object):
 
     def reopen(self):
         self.close()
-        reopen_count = self.reopen_count
-        while reopen_count >= 0:
-            reopen_count -= 1
+        while True:
             try:
                 self.open(tail=False)
                 return True
             except FileError:
                 time.sleep(self.sleep)
-        return False
 
     def check(self, pos):
         try:
@@ -69,14 +67,17 @@ class Tail(object):
                 return True
             if pos > stat.st_size:
                 return True
+            now = time.gmtime(time.time() - self.sleep)
+            path = time.strftime(self.path_template, now)
+            if self.path != path:
+                return True
         except OSError:
             return True
         return False
 
     def wait(self, pos):
         if self.check(pos):
-            if not self.reopen():
-                raise Error('Unable to reopen file: %s' % self.path)
+            self.reopen()
         else:
             self.file.seek(pos)
             time.sleep(self.sleep)
