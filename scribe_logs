@@ -15,6 +15,9 @@ import optparse
 import os
 import sys
 import time
+import signal
+import daemon
+import lockfile
 from thrift.transport import TTransport
 from thrift.transport import TSocket
 from thrift.transport.TTransport import TTransportException
@@ -24,6 +27,7 @@ from scribe import scribe
 class Error(Exception): pass
 class FileError(Error): pass
 
+logs = []
 open_logs = {}
 
 def check_log(path, fd, real_path, inode, pos):
@@ -101,19 +105,14 @@ def send_log_to_scribe(client, category, log, now):
             raise Error('Scribe Error: Unknown error code (%s)' % result)
         message = read_new_lines(log, now)
 
-def send_logs_to_scribe(client, logs, delay=1.0):
-    while True:
-        now = time.localtime(time.time() - delay)
-        for category, log in logs:
-            try:
-                send_log_to_scribe(client, category, log, now)
-            except FileError:
-                # FIXME: log error
-                #print 'unable to open log', log
-                pass
-        time.sleep(delay)
+def send_logs_to_scribe(host, port, config, interval):
+    global logs
+    #logs = load_categories_and_logs_from_config(config)
+    load_categories_and_logs_from_config(config)
+    if logs is None:
+        print 'invalid config file (%s)' % options.config >> sys.stderr, error
+        raise Exception()
 
-def connect_to_scribe(host='127.0.0.1', port=1463):
     socket = TSocket.TSocket(host=host, port=port)
     transport = TTransport.TFramedTransport(socket)
     protocol = TBinaryProtocol.TBinaryProtocol(
@@ -122,11 +121,29 @@ def connect_to_scribe(host='127.0.0.1', port=1463):
         strictWrite=False,
     )
     client = scribe.Client(iprot=protocol, oprot=protocol)
-    return transport, client
+    try:
+        transport.open()
+        print 'sending logs'
+        while True:
+            now = time.localtime(time.time() - interval)
+            for category, log in logs:
+                try:
+                    send_log_to_scribe(client, category, log, now)
+                except FileError:
+                    # FIXME: log error
+                    #print 'unable to open log', log
+                    pass
+            time.sleep(interval)
+    finally:
+        try:
+            transport.close()
+        except Exception:
+            pass
 
-def load_categories_and_logs_from_config(config):
+def load_categories_and_logs_from_config(config='/etc/scribed/logs.conf'):
     # config file syntax is "category file" (eg, its just space separated):
     # test_category /tmp/test.log.%Y-%m-%d_%H-%M-%S
+    global logs
     logs = []
     fd = open(config, 'r')
     for line in fd:
@@ -134,7 +151,8 @@ def load_categories_and_logs_from_config(config):
         if line[0] == '#' or line[0] == '\n':
             continue
         logs.append(line.split())
-    return logs
+    fd.close()
+    #return logs
 
 if __name__ == '__main__':
     parser = optparse.OptionParser()
@@ -160,20 +178,36 @@ if __name__ == '__main__':
         metavar='PORT',
         type='int',
     )
+    parser.add_option(
+        '--interval',
+        default=1.0,
+        dest='interval',
+        help='polling interval in seconds',
+        metavar='INTERVAL',
+        type='float',
+    )
+    parser.add_option(
+        '--daemon',
+        default=False,
+        dest='daemonize',
+        help='daemonize the server on startup',
+        action="store_true",
+    )
     options, args = parser.parse_args()
 
-    logs = load_categories_and_logs_from_config(options.config)
-    if logs is None:
-        print 'invalid config file (%s)' % options.config >> sys.stderr, error
-        sys.exit(1)
+    if options.daemonize:
+        context = daemon.DaemonContext(
+            working_directory='/var/lib/scribed',
+            umask=0x002,
+            pidfile=lockfile.FileLock('/var/run/scribed_logs.pid'),
+            )
 
-    transport, client = connect_to_scribe(options.host, options.port)
-    try:
-        transport.open()
-        print 'sending logs'
-        send_logs_to_scribe(client, logs)
-    finally:
-        try:
-            transport.close()
-        except Exception:
-            pass
+        context.signal_map = {
+            signal.SIGHUP: 'terminate',
+            signal.SIGUSR1: load_categories_and_logs_from_config,
+            }
+
+        with context:
+            send_logs_to_scribe(options.host, options.port, options.config, options.interval)
+    else:
+        send_logs_to_scribe(options.host, options.port, options.config, options.interval)
