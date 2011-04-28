@@ -1,0 +1,244 @@
+#!/usr/bin/env python
+
+# Scribble - a daemon that reads rotating log files into Scribe
+
+# This script tails log files into Scribe. It handles both static and rotating files.
+# To tail rotating files simply specify their filename including a POSIX style date format.
+# eg, for hourly rotated httpd access logs: /var/log/httpd/access.log.%Y-%m-%d-%H
+
+# The config file lists logs and their categories. The syntax is "category file" (its just
+# white-space separated):
+# test_category /tmp/test.log.%Y-%m-%d_%H-%M-%S
+
+import optparse
+import os
+import sys
+import time
+import signal
+import daemon
+import lockfile
+import traceback
+from thrift.transport import TTransport
+from thrift.transport import TSocket
+from thrift.transport.TTransport import TTransportException
+from thrift.protocol import TBinaryProtocol
+from scribe import scribe
+
+class Error(Exception): pass
+class FileError(Error): pass
+
+class Scribble(object):
+
+    logs = []
+    open_logs = {}
+
+    def __init__(self, host, port, config, interval):
+        self.config = config
+        self.interval = interval
+        self.reload_config = False
+        self.runnable = True
+        self.internal_log_format = '%Y-%m-%d_%H-%M-%S ' + os.uname()[1] + ': '
+
+        self.load_categories_and_logs_from_config()
+
+        socket = TSocket.TSocket(host=host, port=port)
+        self.transport = TTransport.TFramedTransport(socket)
+        protocol = TBinaryProtocol.TBinaryProtocol(
+            trans=self.transport,
+            strictRead=False,
+            strictWrite=False,
+        )
+        self.client = scribe.Client(iprot=protocol, oprot=protocol)
+
+    def stop(self, signum, frame):
+        self.runnable = False
+
+    def reload(self, signum, frame):
+        self.send_internal_log_entry('reloading')
+        self.reload_config = True
+
+    def load_categories_and_logs_from_config(self):
+        # config file syntax is "category file" (eg, its just space separated):
+        # test_category /tmp/test.log.%Y-%m-%d_%H-%M-%S
+        self.logs = []
+        fd = open(self.config, 'r')
+        for line in fd:
+            # Skip comments and blank lines
+            if line[0] == '#' or line[0] == '\n':
+                continue
+            self.logs.append(line.split())
+        fd.close()
+        self.reload_config = False
+
+    def check_log(self, path, fd, real_path, inode, pos):
+        try:
+            if real_path != os.path.realpath(path):
+                return True
+            stat = os.stat(path)
+            if inode != stat.st_ino:
+                return True
+            if pos > stat.st_size:
+                return True
+        except OSError:
+            return True
+        return False
+
+    def open_log(self, path, tail=True):
+        try:
+            real_path = os.path.realpath(path)
+            inode = os.stat(path).st_ino
+        except OSError, error:
+            raise FileError(error)
+        try:
+            fd = open(real_path)
+        except IOError, error:
+            raise FileError(error)
+        if tail:
+            fd.seek(0, 2)
+        return fd, real_path, inode
+
+    def send_internal_log_entry(self, message):
+        log_entry = time.strftime(self.internal_log_format, time.localtime(time.time())) + message
+        self.send_log_entry('scribble', log_entry)
+
+    def send_log_entry(self, category, message):
+        log_entry = scribe.LogEntry(
+            category=category,
+            message=message,
+        )
+        result = self.client.Log(messages=[log_entry])
+
+        if result == scribe.ResultCode.OK:
+            pass
+        elif result == scribe.ResultCode.TRY_LATER:
+            raise Error('Scribe Error: TRY LATER')
+        else:
+            raise Error('Scribe Error: Unknown error code (%s)' % result)
+
+    def read_new_lines(self, log, now):
+        path = time.strftime(log, now)
+        try:
+            fd, real_path, inode = self.open_logs[log]
+        except KeyError:
+            fd, real_path, inode = self.open_log(path)
+            self.open_logs[log] = (fd, real_path, inode)
+
+        try:
+            pos = fd.tell()
+        except ValueError:
+            self.send_internal_log_entry('attempted to do IO on a closed file: ' + path)
+            del self.open_logs[log]
+            return
+
+        line = fd.readline().strip()
+        #print 'new line: "%s"' % line
+        if not line:
+            if self.check_log(path, fd, real_path, inode, pos):
+                fd.close()
+                fd, real_path, inode = self.open_log(path, tail=False)
+                self.open_logs[log] = (fd, real_path, inode)
+            else:
+                fd.seek(pos)
+                self.open_logs[log] = (fd, real_path, inode)
+        else:
+            return line
+
+    def send_logs(self):
+        now = time.localtime(time.time() - self.interval)
+        for category, log in self.logs:
+            try:
+                message = self.read_new_lines(log, now)
+                while message:
+                    self.send_log_entry(category, message)
+                    message = self.read_new_lines(log, now)
+            except FileError:
+                self.send_internal_log_entry('unable to open log, ' + log)
+
+    def start(self):
+        if self.logs is None:
+            self.send_internal_log_entry('invalid config file: ' + self.logs)
+            raise Exception()
+
+        try:
+            self.transport.open()
+            self.send_internal_log_entry('starting')
+            while self.runnable:
+                self.send_logs()
+                if self.reload_config:
+                    self.load_categories_and_logs_from_config()
+                time.sleep(self.interval)
+        except KeyboardInterrupt:
+            pass
+        except (Error, TTransportException), error:
+            print >> sys.stderr, error
+        finally:
+            try:
+                stack_trace = traceback.format_exc()
+                if stack_trace:
+                    self.send_internal_log_entry(stack_trace)
+                self.send_internal_log_entry('stopping')
+                self.transport.close()
+            except Exception:
+                pass
+
+if __name__ == '__main__':
+    parser = optparse.OptionParser()
+    parser.add_option(
+        '--config',
+        dest='config',
+        default='/etc/scribed/logs.conf',
+        help='configuration file which lists categories and logs',
+        metavar='FILE',
+    )
+    parser.add_option(
+        '--host',
+        default='127.0.0.1',
+        dest='host',
+        help='destination Scribe host server',
+        metavar='HOST',
+    )
+    parser.add_option(
+        '--port',
+        default=1463,
+        dest='port',
+        help='destination Scribe port',
+        metavar='PORT',
+        type='int',
+    )
+    parser.add_option(
+        '--interval',
+        default=1.0,
+        dest='interval',
+        help='polling interval in seconds',
+        metavar='INTERVAL',
+        type='float',
+    )
+    parser.add_option(
+        '--daemon',
+        default=False,
+        dest='daemonize',
+        help='daemonize the server on startup',
+        action="store_true",
+    )
+    options, args = parser.parse_args()
+
+    scribble = Scribble(options.host, options.port, options.config, options.interval)
+
+    if options.daemonize:
+        context = daemon.DaemonContext(
+            working_directory='/var/log',
+            umask=0x002,
+            #pidfile='/var/run/scribble.pid',
+            )
+
+        context.signal_map = {
+            signal.SIGTERM: scribble.stop,
+            signal.SIGHUP: scribble.reload,
+            }
+
+        with context:
+            #lockfile.FileLock('/var/run/scribed_logs.pid'),
+            scribble.start()
+            #context.pidfile.release()
+    else:
+        scribble.start()
