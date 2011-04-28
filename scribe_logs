@@ -1,0 +1,179 @@
+#!/usr/bin/env python
+
+# Created 27/04/2011 by David Robinson <david.robinson@betfair.com>
+# Based on scribe_log - https://github.com/silas/scribe_log.git
+
+# This script tails log files into Scribe and handles both static and rotating files.
+# To tail rotating files simply specify their filename including a POSIX style date format.
+# eg, for hourly rotated httpd access logs: /var/log/httpd/access.log.%Y-%m-%d-%H
+
+# The config file lists logs and their categories. The syntax is "category file" (its just
+# white-space separated):
+# test_category /tmp/test.log.%Y-%m-%d_%H-%M-%S
+
+import optparse
+import os
+import sys
+import time
+from thrift.transport import TTransport
+from thrift.transport import TSocket
+from thrift.transport.TTransport import TTransportException
+from thrift.protocol import TBinaryProtocol
+from scribe import scribe
+
+class Error(Exception): pass
+class FileError(Error): pass
+
+open_logs = {}
+
+def check_log(path, fd, real_path, inode, pos):
+    try:
+        if real_path != os.path.realpath(path):
+            return True
+        stat = os.stat(path)
+        if inode != stat.st_ino:
+            return True
+        if pos > stat.st_size:
+            return True
+    except OSError:
+        return True
+    return False
+
+def open_log(path, tail=True):
+    try:
+        real_path = os.path.realpath(path)
+        inode = os.stat(path).st_ino
+    except OSError, error:
+        raise FileError(error)
+    try:
+        fd = open(real_path)
+    except IOError, error:
+        raise FileError(error)
+    if tail:
+        fd.seek(0, 2)
+    return fd, real_path, inode
+
+def read_new_lines(log, now):
+    path = time.strftime(log, now)
+    try:
+        fd, real_path, inode = open_logs[log]
+    except KeyError:
+        fd, real_path, inode = open_log(path)
+        open_logs[log] = (fd, real_path, inode)
+
+    try:
+        pos = fd.tell()
+    except ValueError:
+        # FIXME: log error
+        #print 'attempted to do IO on a closed file', path
+        del open_logs[log]
+        return
+
+    line = fd.readline()
+    #print 'new line', line
+    if not line:
+        if check_log(path, fd, real_path, inode, pos):
+            fd.close()
+            fd, real_path, inode = open_log(path, tail=False)
+            open_logs[log] = (fd, real_path, inode)
+        else:
+            fd.seek(pos)
+            open_logs[log] = (fd, real_path, inode)
+    else:
+        return line
+
+
+
+def send_log_to_scribe(client, category, log, now):
+    message = read_new_lines(log, now)
+    while message:
+        log_entry = scribe.LogEntry(
+            category=category,
+            message=message,
+        )
+        result = client.Log(messages=[log_entry])
+
+        if result == scribe.ResultCode.OK:
+            pass
+        elif result == scribe.ResultCode.TRY_LATER:
+            raise Error('Scribe Error: TRY LATER')
+        else:
+            raise Error('Scribe Error: Unknown error code (%s)' % result)
+        message = read_new_lines(log, now)
+
+def send_logs_to_scribe(client, logs, delay=1.0):
+    while True:
+        now = time.localtime(time.time() - delay)
+        for category, log in logs:
+            try:
+                send_log_to_scribe(client, category, log, now)
+            except FileError:
+                # FIXME: log error
+                #print 'unable to open log', log
+                pass
+        time.sleep(delay)
+
+def connect_to_scribe(host='127.0.0.1', port=1463):
+    socket = TSocket.TSocket(host=host, port=port)
+    transport = TTransport.TFramedTransport(socket)
+    protocol = TBinaryProtocol.TBinaryProtocol(
+        trans=transport,
+        strictRead=False,
+        strictWrite=False,
+    )
+    client = scribe.Client(iprot=protocol, oprot=protocol)
+    return transport, client
+
+def load_categories_and_logs_from_config(config):
+    # config file syntax is "category file" (eg, its just space separated):
+    # test_category /tmp/test.log.%Y-%m-%d_%H-%M-%S
+    logs = []
+    fd = open(config, 'r')
+    for line in fd:
+        # Skip comments and blank lines
+        if line[0] == '#' or line[0] == '\n':
+            continue
+        logs.append(line.split())
+    return logs
+
+if __name__ == '__main__':
+    parser = optparse.OptionParser()
+    parser.add_option(
+        '--config',
+        dest='config',
+        default='/etc/scribed/logs.conf',
+        help='configuration file which lists categories and logs',
+        metavar='FILE',
+    )
+    parser.add_option(
+        '--host',
+        default='127.0.0.1',
+        dest='host',
+        help='destination Scribe host server',
+        metavar='HOST',
+    )
+    parser.add_option(
+        '--port',
+        default=1463,
+        dest='port',
+        help='destination Scribe port',
+        metavar='PORT',
+        type='int',
+    )
+    options, args = parser.parse_args()
+
+    logs = load_categories_and_logs_from_config(options.config)
+    if logs is None:
+        print 'invalid config file (%s)' % options.config >> sys.stderr, error
+        sys.exit(1)
+
+    transport, client = connect_to_scribe(options.host, options.port)
+    try:
+        transport.open()
+        print 'sending logs'
+        send_logs_to_scribe(client, logs)
+    finally:
+        try:
+            transport.close()
+        except Exception:
+            pass
